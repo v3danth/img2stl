@@ -1,251 +1,206 @@
+"""Turns an image into 3D-printable models.
+
+Outputs, in <image name>_3d/ next to the image unless --out-dir is given:
+  relief.stl               the whole image as a slab, darker pixels raised
+  cutout.stl               only the subject, same relief, no slab
+  color_original.ply/.obj  the cut-out with the image's own colours (OBJ for Bambu Studio)
+  color_palette.3mf        the cut-out split into a few flat colours, one part each
+  color_palette_parts/     the same parts as separate STLs
+  flat.stl                 the cut-out at one height, no relief
+  flat_color_palette.3mf   the flat cut-out split into the same colours
+  edges.stl                only the line art, at one height
+"""
+
+import argparse
+import logging
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
 import cv2
 import numpy as np
-import tkinter as tk
-from PIL import Image, ImageTk
-from stl import mesh
-from tqdm import tqdm
-import asyncio
-import sys
 
-async def update_ui(root):
-    while True:
-        try:
-            root.update()
-            await asyncio.sleep(0.1)
-        except tk.TclError:
-            break
+import exporters
+import imagemaps
+import meshing
+from preview import show_preview
 
-async def generate_3d_model(image_path, depth_levels=10, target_width=100, base_height=2, max_dimension=1000):
-    """
-    Convert an image to a 3D STL model where:
-    - Model width is fixed to target_width (mm)
-    - Height is scaled proportionally 
-    - Depth is subtracted from infill layers
-    - Base layer + depth_levels additional layers
-    - Shows depth visualization
-    - Each layer is 0.2mm thick
-    - Smooth walls with infill subtraction
-    
-    :param image_path: Path to the input image
-    :param depth_levels: Number of depth levels (excluding base)
-    :param target_width: Desired width of the model in mm
-    :param base_height: Height of the base plate in mm
-    :param max_dimension: Maximum dimension for image processing
-    """
-    print("Loading and processing image...")
-    # Read and process image
-    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+log = logging.getLogger("img2depth")
 
-    if img is None:
-        print("Error: Unable to load image.")
-        return
+# Region value for pixels outside the subject; palette indices are below it.
+BACKGROUND = 255
 
-    # Store original image for display
-    if len(img.shape) == 3:
-        original_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    else:
-        original_img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
 
-    # Handle transparency and convert to grayscale
-    if len(img.shape) == 3 and img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
-    elif len(img.shape) == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+@dataclass(frozen=True)
+class Settings:
+    target_width: float = 100.0  # mm
+    base_height: float = 2.0  # mm under the lightest pixel
+    relief_height: float = 4.0  # mm added for the darkest pixel
+    max_dimension: int = 1000  # pixels; larger images are scaled down
+    palette_size: int = 4
+    flat_height: float = 3.0  # mm, for the flat and edge models
+    line_width: float = 0.8  # mm, for the edge model; about two nozzle widths
 
-    # Store grayscale image for display
-    grayscale_img = img.copy()
 
-    # Resize if image is too large
-    height, width = img.shape
-    if max(height, width) > max_dimension:
-        scale = max_dimension / max(height, width)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
-        img = cv2.resize(img, (new_width, new_height))
-        original_img = cv2.resize(original_img, (new_width, new_height))
-        grayscale_img = cv2.resize(grayscale_img, (new_width, new_height))
-        height, width = img.shape
+def save(writer: Callable[..., None], mesh: meshing.Mesh, path: Path, *extra) -> Path:
+    start = time.perf_counter()
+    writer(mesh, path, *extra)
+    log.info("wrote %s triangles=%d seconds=%.1f", path.name, len(mesh.faces), time.perf_counter() - start)
+    return path
 
-    # Reduce detail by downscaling and then upscaling
-    scale_factor = 0.25  # Reduce to 25% of original size
-    small_width = int(width * scale_factor)
-    small_height = int(height * scale_factor)
-    img = cv2.resize(img, (small_width, small_height))
-    img = cv2.resize(img, (width, height))
 
-    # Calculate mm per pixel to achieve target width
-    mm_per_pixel = target_width / width
-    mm_height = height * mm_per_pixel
-    mm_width = width * mm_per_pixel
+def write_models(
+    maps: imagemaps.ImageMaps,
+    regions: np.ndarray,
+    palette: np.ndarray,
+    edges: np.ndarray,
+    out_dir: Path,
+    settings: Settings,
+) -> list[Path]:
+    rows, cols = regions.shape
+    mm_per_pixel = settings.target_width / cols
+    subject = regions != BACKGROUND
+    whole = np.ones_like(subject)
+    parts_dir = out_dir / "color_palette_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    flat_heights = np.full((rows + 1, cols + 1), settings.flat_height, np.float32)
 
-    # Apply preprocessing to remove noise and small particles
-    print("Preprocessing image...")
-    kernel = np.ones((5,5), np.uint8)  # Increased kernel size for more smoothing
-    img = cv2.morphologyEx(img, cv2.MORPH_OPEN, kernel)
-    img = cv2.morphologyEx(img, cv2.MORPH_CLOSE, kernel)
-    img = cv2.GaussianBlur(img, (5,5), 0)  # Additional smoothing
-    
-    # Create infill pattern
-    print("Generating infill pattern...")
-    infill_layers = 10
-    layer_height = 0.2  # mm per layer
-    total_height = infill_layers * layer_height + base_height  # Add base height
-    
-    # Normalize image for depth calculation
-    print("Normalizing image depth...")
-    img_normalized = cv2.normalize(img, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F)
-    
-    # Calculate depth and add base height
-    Z = total_height * (1 - img_normalized) + base_height  # Add base height to all Z values
-    
-    # Show depth visualization using Tkinter
-    print("Creating depth visualization...")
-    root = tk.Tk()
-    root.title("Image Processing Visualization")
+    relief = meshing.heightfield_mesh(meshing.corner_average(maps.heights, whole), whole, mm_per_pixel)
+    outputs = [save(exporters.write_stl, relief, out_dir / "relief.stl")]
 
-    # Convert Z values to display image
-    depth_img = ((Z / total_height) * 255).astype(np.uint8)
-    depth_img = cv2.applyColorMap(depth_img, cv2.COLORMAP_VIRIDIS)
-    depth_img = cv2.cvtColor(depth_img, cv2.COLOR_BGR2RGB)
+    # Every subject-shaped model shares these corner heights, so palette
+    # parts meet the cut-out's surface and each other without seams.
+    subject_heights = meshing.corner_average(maps.heights, subject)
+    cutout = meshing.heightfield_mesh(subject_heights, subject, mm_per_pixel)
+    outputs.append(save(exporters.write_stl, cutout, out_dir / "cutout.stl"))
 
-    # Scale for display
-    max_display_size = 400
-    scale = min(max_display_size / depth_img.shape[1], max_display_size / depth_img.shape[0])
-    if scale < 1:
-        new_width = int(depth_img.shape[1] * scale)
-        new_height = int(height * scale)
-        depth_img = cv2.resize(depth_img, (new_width, new_height))
-        original_img = cv2.resize(original_img, (new_width, new_height))
-        grayscale_img = cv2.resize(grayscale_img, (new_width, new_height))
+    corner_rgb = meshing.corner_average(maps.rgb.astype(np.float32), subject).reshape(-1, 3)
+    vertex_rgb = np.rint(corner_rgb[cutout.corners]).astype(np.uint8)
+    outputs.append(save(exporters.write_ply, cutout, out_dir / "color_original.ply", vertex_rgb))
+    outputs.append(save(exporters.write_obj, cutout, out_dir / "color_original.obj", vertex_rgb))
 
-    # Create frames for each image
-    frame1 = tk.Frame(root)
-    frame1.pack(side=tk.LEFT, padx=5)
-    frame2 = tk.Frame(root)
-    frame2.pack(side=tk.LEFT, padx=5)
-    frame3 = tk.Frame(root)
-    frame3.pack(side=tk.LEFT, padx=5)
+    outputs += write_palette(regions, palette, subject_heights, mm_per_pixel, out_dir / "color_palette.3mf", parts_dir)
 
-    # Create labels for each image
-    tk.Label(frame1, text="Original Image").pack()
-    canvas1 = tk.Canvas(frame1, width=new_width, height=new_height)
-    canvas1.pack()
+    flat = meshing.heightfield_mesh(flat_heights, subject, mm_per_pixel)
+    outputs.append(save(exporters.write_stl, flat, out_dir / "flat.stl"))
+    outputs += write_palette(regions, palette, flat_heights, mm_per_pixel, out_dir / "flat_color_palette.3mf")
 
-    tk.Label(frame2, text="Grayscale Image").pack()
-    canvas2 = tk.Canvas(frame2, width=new_width, height=new_height)
-    canvas2.pack()
+    outputs.append(
+        save(exporters.write_stl, meshing.heightfield_mesh(flat_heights, edges, mm_per_pixel), out_dir / "edges.stl")
+    )
 
-    tk.Label(frame3, text="Depth Visualization").pack()
-    canvas3 = tk.Canvas(frame3, width=new_width, height=new_height)
-    canvas3.pack()
+    log.info(
+        "model size width_mm=%.1f depth_mm=%.1f max_height_mm=%.1f",
+        cols * mm_per_pixel,
+        rows * mm_per_pixel,
+        float(maps.heights.max()),
+    )
+    return outputs
 
-    # Convert and display images with proper references
-    img_pil_original = Image.fromarray(original_img)
-    img_tk_original = ImageTk.PhotoImage(image=img_pil_original)
-    canvas1.create_image(0, 0, anchor=tk.NW, image=img_tk_original)
-    canvas1.image = img_tk_original  # Keep reference
-    
-    img_pil_gray = Image.fromarray(grayscale_img)
-    img_tk_gray = ImageTk.PhotoImage(image=img_pil_gray)
-    canvas2.create_image(0, 0, anchor=tk.NW, image=img_tk_gray)
-    canvas2.image = img_tk_gray  # Keep reference
-    
-    img_pil_depth = Image.fromarray(depth_img)
-    img_tk_depth = ImageTk.PhotoImage(image=img_pil_depth)
-    canvas3.create_image(0, 0, anchor=tk.NW, image=img_tk_depth)
-    canvas3.image = img_tk_depth  # Keep reference
 
-    # Start UI update task
-    ui_task = asyncio.create_task(update_ui(root))
+def edge_cells(maps: imagemaps.ImageMaps, subject: np.ndarray, line_px: float) -> np.ndarray:
+    return meshing.without_pinches(imagemaps.edge_mask(maps.rgb, subject, line_px).astype(np.uint8)) == 1
 
-    print("Creating vertex grid...")
-    # Create vertex grid - flip X coordinates to mirror the model
-    x = np.linspace(mm_width, 0, width)  # Reversed x coordinates
-    y = np.linspace(0, mm_height, height)
-    X, Y = np.meshgrid(x, y)
-    
-    # Create vertices for top surface and base
-    print("Generating vertices...")
-    vertices_top = np.column_stack((X.flatten(), Y.flatten(), Z.flatten()))
-    vertices_bottom = np.column_stack((X.flatten(), Y.flatten(), np.zeros_like(Z.flatten())))
-    
-    print("Creating faces...")
-    # Create faces for top and bottom surfaces
-    faces = []
-    for i in range(height - 1):
-        for j in range(width - 1):
-            # Top surface triangles
-            v0 = i * width + j
-            v1 = v0 + 1
-            v2 = (i + 1) * width + j
-            v3 = v2 + 1
-            
-            # Add two triangles for top surface (corrected winding order)
-            faces.append([v0, v2, v1])
-            faces.append([v1, v2, v3])
-            
-            # Bottom surface triangles
-            v0_b = v0 + (height * width)  # Offset for bottom vertices
-            v1_b = v1 + (height * width)
-            v2_b = v2 + (height * width)
-            v3_b = v3 + (height * width)
-            
-            # Add two triangles for bottom surface (corrected winding order)
-            faces.append([v0_b, v1_b, v2_b])
-            faces.append([v1_b, v3_b, v2_b])
-            
-            # Add side wall triangles
-            if j == 0:  # Left wall
-                faces.append([v0, v0_b, v2])
-                faces.append([v2, v0_b, v2_b])
-            if j == width - 2:  # Right wall
-                faces.append([v1, v3, v1_b])
-                faces.append([v3, v3_b, v1_b])
-            if i == 0:  # Front wall
-                faces.append([v0, v1, v0_b])
-                faces.append([v1, v1_b, v0_b])
-            if i == height - 2:  # Back wall
-                faces.append([v2, v2_b, v3])
-                faces.append([v3, v2_b, v3_b])
 
-    faces = np.array(faces)
-    
-    print("Creating final mesh...")
-    # Combine vertices and create mesh
-    all_vertices = np.vstack([vertices_top, vertices_bottom])
-    model = mesh.Mesh(np.zeros(len(faces), dtype=mesh.Mesh.dtype))
-    for i, face in enumerate(faces):
-        for j in range(3):
-            model.vectors[i][j] = all_vertices[face[j]]
-    
-    # Fix mesh normals
-    model.update_normals()
-    
-    # Save the STL file
-    output_path = image_path.rsplit('.', 1)[0] + '_3d.stl'
-    print(f"Saving STL file to {output_path}...")
-    model.save(output_path)
-    
-    print(f"\nModel successfully created!")
-    print(f"Model dimensions: {mm_width:.1f}mm x {mm_height:.1f}mm")
-    print(f"Total height: {total_height}mm (Base: {base_height}mm + {infill_layers} layers * {layer_height}mm)")
-    
-    # Keep window open until user closes it
-    root.mainloop()
-    
-    # Cancel UI update task when window is closed
-    ui_task.cancel()
+def write_palette(
+    regions: np.ndarray,
+    palette: np.ndarray,
+    corner_heights: np.ndarray,
+    mm_per_pixel: float,
+    path: Path,
+    parts_dir: Path | None = None,
+) -> list[Path]:
+    """Writes one coloured part per palette entry to a 3MF, and to separate
+    STLs as well when parts_dir is given."""
+    outputs, parts = [], []
+    for index, rgb in enumerate(palette):
+        cells = regions == index
+        if not cells.any():
+            continue
+        name = f"color_{index + 1}_{exporters.rgb_to_hex(rgb)[1:]}"
+        part = meshing.heightfield_mesh(corner_heights, cells, mm_per_pixel)
+        if parts_dir is not None:
+            outputs.append(save(exporters.write_stl, part, parts_dir / f"{name}.stl"))
+        parts.append(exporters.ColoredPart(name, part, rgb))
+    start = time.perf_counter()
+    exporters.write_3mf(parts, path)
+    log.info("wrote %s parts=%d seconds=%.1f", path.name, len(parts), time.perf_counter() - start)
+    return [*outputs, path]
+
+
+def preview_panels(
+    maps: imagemaps.ImageMaps, regions: np.ndarray, palette: np.ndarray, edges: np.ndarray
+) -> list[tuple[str, np.ndarray]]:
+    span = float(np.ptp(maps.heights)) or 1.0
+    depth = ((maps.heights - maps.heights.min()) / span * 255).astype(np.uint8)
+    depth = cv2.cvtColor(cv2.applyColorMap(depth, cv2.COLORMAP_VIRIDIS), cv2.COLOR_BGR2RGB)
+    white = np.full_like(maps.rgb, 255)
+    subject = (regions != BACKGROUND)[..., None]
+    flat = palette[np.minimum(regions, len(palette) - 1)]
+    return [
+        ("Original", maps.rgb),
+        ("Depth", depth),
+        ("Cut-out", np.where(subject, maps.rgb, white)),
+        (f"Palette ({len(palette)} colours)", np.where(subject, flat, white)),
+        ("Edges", np.where(edges[..., None], 0, white).astype(np.uint8)),
+    ]
+
+
+def positive(kind: type) -> Callable[[str], float]:
+    def parse(text: str):
+        value = kind(text)
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"must be positive, got {text}")
+        return value
+
+    return parse
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    defaults = Settings()
+    parser = argparse.ArgumentParser(description="Convert an image into 3D-printable models.")
+    parser.add_argument("image", type=Path)
+    parser.add_argument("--out-dir", type=Path, help="default: <image dir>/<image name>_3d")
+    parser.add_argument("--width", type=positive(float), default=defaults.target_width, help="model width in mm")
+    parser.add_argument("--base", type=positive(float), default=defaults.base_height, help="base height in mm")
+    parser.add_argument("--relief", type=positive(float), default=defaults.relief_height, help="relief depth in mm")
+    parser.add_argument("--max-dimension", type=positive(int), default=defaults.max_dimension)
+    parser.add_argument("--colors", type=positive(int), default=defaults.palette_size, help="palette size")
+    parser.add_argument(
+        "--flat-height", type=positive(float), default=defaults.flat_height, help="flat and edge model height in mm"
+    )
+    parser.add_argument("--line-width", type=positive(float), default=defaults.line_width, help="edge line width in mm")
+    parser.add_argument("--no-preview", action="store_true", help="skip the preview window")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    args = parse_args(argv)
+    if args.colors >= BACKGROUND:
+        log.error("--colors must be below %d, got %d", BACKGROUND, args.colors)
+        return 2
+    settings = Settings(
+        args.width, args.base, args.relief, args.max_dimension, args.colors, args.flat_height, args.line_width
+    )
+    out_dir = args.out_dir or args.image.with_name(f"{args.image.stem}_3d")
     try:
-        await ui_task
-    except asyncio.CancelledError:
-        pass
-    
-    return model
+        maps = imagemaps.image_maps(args.image, settings.max_dimension, settings.base_height, settings.relief_height)
+    except ValueError as err:
+        log.error("%s", err)
+        return 1
+    labels, palette = imagemaps.palette_labels(maps.rgb, maps.subject, settings.palette_size)
+    regions = meshing.without_pinches(np.where(maps.subject, labels, BACKGROUND).astype(np.uint8))
+    line_px = settings.line_width * regions.shape[1] / settings.target_width
+    edges = edge_cells(maps, regions != BACKGROUND, line_px)
+    write_models(maps, regions, palette, edges, out_dir, settings)
+    log.info("done out_dir=%s", out_dir)
+    if not args.no_preview:
+        show_preview(preview_panels(maps, regions, palette, edges))
+    return 0
+
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python img2depth.py <image_path>")
-        sys.exit(1)
-        
-    image_path = sys.argv[1]
-    asyncio.run(generate_3d_model(image_path, depth_levels=10, target_width=100, base_height=2))
+    sys.exit(main(sys.argv[1:]))

@@ -99,6 +99,27 @@ async def generate_3d_model(image_path, depth_levels=10, target_width=100, base_
 ### **Command Line Execution**
 To run the script, use the following command:
 
+```
+python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
+.venv/bin/python img2depth.py path/to/image.png
+```
+
+Options: `--width` (mm, default 100), `--base` (mm, default 2), `--relief` (mm, default 4),
+`--colors` (palette size, default 4), `--max-dimension` (px, default 1000), `--out-dir`, `--no-preview`.
+
+### **Outputs**
+Written to `<image name>_3d/` next to the image:
+
+| File | What it is |
+|---|---|
+| `relief.stl` | The whole image as a slab; darker pixels are raised. |
+| `cutout.stl` | Only the subject, same relief, no slab. The subject comes from the alpha channel, or from the border colour when there is no transparency. |
+| `color_original.ply` | The cut-out with the image's original colours (view in MeshLab, Blender or Quick Look). |
+| `color_palette.3mf` | The cut-out split into `--colors` flat colours, one coloured part each, for multi-material printing. |
+| `color_palette_parts/*.stl` | The same parts as separate STLs, named by colour. |
+
+Run the tests with `.venv/bin/pytest`.
+
 ## **Examples** (Ultimaker Cura for 3D printing)
 ![image](https://github.com/user-attachments/assets/ff2bafa7-1fd0-491c-b700-424ed9d4fae6)
 ![image](https://github.com/user-attachments/assets/0688eeeb-ec5c-430f-9cfa-83e82b817070)

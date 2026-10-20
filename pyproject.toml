@@ -1,0 +1,18 @@
+[project]
+name = "img2stl"
+version = "0.2.0"
+requires-python = ">=3.10"
+dependencies = ["numpy", "opencv-python", "numpy-stl", "pillow"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.setuptools]
+py-modules = ["img2depth", "imagemaps", "meshing", "exporters", "preview"]
